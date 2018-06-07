@@ -49,6 +49,7 @@
     "webpack": "^3.5.5"
   },
   "dependencies": {
+    "uuid": "^3.2.1",
     "@aws-amplify/core": "^0.1.0",
     "@aws-amplify/cache": "^0.1.0"
   },
