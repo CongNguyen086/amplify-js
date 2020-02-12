@@ -1,8 +1,11 @@
+import {
+	FirehoseClient,
+	PutRecordBatchCommand,
+} from '@aws-sdk/client-firehose';
 import { Credentials } from '@aws-amplify/core';
-import KinesisProvider from '../../src/Providers/AWSKinesisProvider';
-import { KinesisClient, PutRecordsCommand } from '@aws-sdk/client-kinesis';
+import KinesisFirehoseProvider from '../../src/Providers/AWSKinesisFirehoseProvider';
 
-jest.useFakeTimers();
+jest.mock('@aws-sdk/client-firehose');
 
 const credentials = {
 	accessKeyId: 'accessKeyId',
@@ -12,11 +15,11 @@ const credentials = {
 	authenticated: true,
 };
 
-jest.mock('@aws-sdk/client-kinesis');
+jest.useFakeTimers();
 
 beforeEach(() => {
-	KinesisClient.prototype.send = jest.fn(async command => {
-		if (command instanceof PutRecordsCommand) {
+	FirehoseClient.prototype.send = jest.fn(async command => {
+		if (command instanceof PutRecordBatchCommand) {
 			return 'data';
 		}
 	});
@@ -26,10 +29,10 @@ afterEach(() => {
 	jest.restoreAllMocks();
 });
 
-describe('kinesis provider test', () => {
+describe('kinesis firehose provider test', () => {
 	describe('getCategory test', () => {
 		test('happy case', () => {
-			const analytics = new KinesisProvider();
+			const analytics = new KinesisFirehoseProvider();
 
 			expect(analytics.getCategory()).toBe('Analytics');
 		});
@@ -37,15 +40,15 @@ describe('kinesis provider test', () => {
 
 	describe('getProviderName test', () => {
 		test('happy case', () => {
-			const analytics = new KinesisProvider();
+			const analytics = new KinesisFirehoseProvider();
 
-			expect(analytics.getProviderName()).toBe('AWSKinesis');
+			expect(analytics.getProviderName()).toBe('AWSKinesisFirehose');
 		});
 	});
 
 	describe('configure test', () => {
 		test('happy case', () => {
-			const analytics = new KinesisProvider();
+			const analytics = new KinesisFirehoseProvider();
 
 			expect(analytics.configure({ region: 'region1' })).toEqual({
 				bufferSize: 1000,
@@ -59,7 +62,7 @@ describe('kinesis provider test', () => {
 
 	describe('record test', () => {
 		test('record without credentials', async () => {
-			const analytics = new KinesisProvider();
+			const analytics = new KinesisFirehoseProvider();
 
 			const spyon = jest
 				.spyOn(Credentials, 'get')
@@ -68,16 +71,18 @@ describe('kinesis provider test', () => {
 				});
 
 			expect(await analytics.record('params')).toBe(false);
+			spyon.mockRestore();
 		});
 
 		test('record happy case', async () => {
-			const analytics = new KinesisProvider();
+			const analytics = new KinesisFirehoseProvider();
+			analytics.configure({ region: 'region1' });
 
-			const spyon = jest
-				.spyOn(Credentials, 'get')
-				.mockImplementationOnce(() => {
-					return Promise.resolve(credentials);
-				});
+			const spyon = jest.spyOn(FirehoseClient.prototype, 'send');
+
+			jest.spyOn(Credentials, 'get').mockImplementationOnce(() => {
+				return Promise.resolve(credentials);
+			});
 
 			await analytics.record({
 				event: {
@@ -90,6 +95,10 @@ describe('kinesis provider test', () => {
 			});
 
 			jest.advanceTimersByTime(6000);
+
+			expect(spyon).toBeCalled();
+
+			spyon.mockRestore();
 		});
 	});
 });
