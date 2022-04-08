@@ -95,6 +95,7 @@ export class PageViewTracker {
 				{
 					name: this._config.eventName || 'pageView',
 					attributes,
+					immediate: this._config.immediate,
 				},
 				this._config.provider
 			).catch(e => {
@@ -132,6 +133,7 @@ export class PageViewTracker {
 				{
 					name: this._config.eventName || 'pageView',
 					attributes,
+					immediate: this._config.immediate,
 				},
 				this._config.provider
 			).catch(e => {

@@ -39,6 +39,7 @@ export interface pageViewTrackOpts {
 		| EventAttributes
 		| (() => EventAttributes | Promise<EventAttributes>);
 	getUrl?: () => string;
+	immediate?: boolean;
 }
 
 export interface EventTrackOpts {
