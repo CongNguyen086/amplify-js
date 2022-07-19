@@ -614,7 +614,9 @@ export class AWSPinpointProvider implements AnalyticsProvider {
 		);
 		if (!endpointId) {
 			endpointId = uuid();
-			Cache.setItem(cacheKey, endpointId);
+			const ttl = 1000 * 60 * 60 * 24 * 365 * 100; // 100 years
+			const expiration = new Date().getTime() + ttl;
+			Cache.setItem(cacheKey, endpointId, { expires: expiration });
 		}
 		return endpointId;
 	}
