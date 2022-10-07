@@ -16,13 +16,12 @@ import {
 	ModelAttributeAuth,
 	ModelAuthRule,
 	utils,
+	GraphQLScalarType,
 } from '@aws-amplify/datastore';
 
-import { getSQLiteType } from './types';
+import { ParameterizedStatement } from './types';
 
 const { USER, isNonModelConstructor, isModelConstructor } = utils;
-
-export type ParameterizedStatement = [string, any[]];
 
 const keysFromModel = model =>
 	Object.keys(model)
@@ -72,6 +71,36 @@ function prepareValueForDML(value: unknown): any {
 	return `${value}`;
 }
 
+export function getSQLiteType(
+	scalar: keyof Omit<
+		typeof GraphQLScalarType,
+		'getJSType' | 'getValidationFunction' | 'getSQLiteType'
+	>
+): 'TEXT' | 'INTEGER' | 'REAL' | 'BLOB' {
+	switch (scalar) {
+		case 'Boolean':
+		case 'Int':
+		case 'AWSTimestamp':
+			return 'INTEGER';
+		case 'ID':
+		case 'String':
+		case 'AWSDate':
+		case 'AWSTime':
+		case 'AWSDateTime':
+		case 'AWSEmail':
+		case 'AWSJSON':
+		case 'AWSURL':
+		case 'AWSPhone':
+		case 'AWSIPAddress':
+			return 'TEXT';
+		case 'Float':
+			return 'REAL';
+		default:
+			const _: never = scalar as never;
+			throw new Error(`unknown type ${scalar as string}`);
+	}
+}
+
 export function generateSchemaStatements(schema: InternalSchema): string[] {
 	return Object.keys(schema.namespaces).flatMap(namespaceName => {
 		const namespace = schema.namespaces[namespaceName];
@@ -119,7 +148,7 @@ export function modelCreateTableStatement(
 	let fields = Object.values(model.fields).reduce((acc, field: ModelField) => {
 		if (isGraphQLScalarType(field.type)) {
 			if (field.name === 'id') {
-				return acc + '"id" PRIMARY KEY NOT NULL';
+				return [...acc, '"id" PRIMARY KEY NOT NULL'];
 			}
 
 			let columnParam = `"${field.name}" ${getSQLiteType(field.type)}`;
@@ -128,7 +157,7 @@ export function modelCreateTableStatement(
 				columnParam += ' NOT NULL';
 			}
 
-			return acc + `, ${columnParam}`;
+			return [...acc, `${columnParam}`];
 		}
 
 		if (isModelFieldType(field.type)) {
@@ -138,7 +167,7 @@ export function modelCreateTableStatement(
 			if (isTargetNameAssociation(field.association)) {
 				// check if this field has been explicitly defined in the model
 				const fkDefinedInModel = Object.values(model.fields).find(
-					(f: ModelField) => f.name === field.association.targetName
+					(f: ModelField) => f.name === field?.association?.targetName
 				);
 
 				// if the FK is not explicitly defined in the model, we have to add it here
@@ -150,7 +179,7 @@ export function modelCreateTableStatement(
 
 			// ignore isRequired param for model fields, since they will not contain
 			// the related data locally
-			return acc + `, ${columnParam}`;
+			return [...acc, `${columnParam}`];
 		}
 
 		// default to TEXT
@@ -160,19 +189,25 @@ export function modelCreateTableStatement(
 			columnParam += ' NOT NULL';
 		}
 
-		return acc + `, ${columnParam}`;
-	}, '');
+		return [...acc, `${columnParam}`];
+	}, [] as string[]);
 
 	implicitAuthFields.forEach((authField: string) => {
-		fields += `, ${authField} TEXT`;
+		fields.push(`${authField} TEXT`);
 	});
 
 	if (userModel) {
-		fields +=
-			', "_version" INTEGER, "_lastChangedAt" INTEGER, "_deleted" INTEGER';
+		fields = [
+			...fields,
+			`"_version" INTEGER`,
+			`"_lastChangedAt" INTEGER`,
+			`"_deleted" INTEGER`,
+		];
 	}
 
-	const createTableStatement = `CREATE TABLE IF NOT EXISTS "${model.name}" (${fields});`;
+	const createTableStatement = `CREATE TABLE IF NOT EXISTS "${
+		model.name
+	}" (${fields.join(', ')});`;
 	return createTableStatement;
 }
 
@@ -230,6 +265,30 @@ const logicalOperatorMap = {
 	between: 'BETWEEN',
 };
 
+/**
+ * If the given (operator, operand) indicate the need for a special `NULL` comparison,
+ * that `WHERE` clause condition will be returned. If not special `NULL` handling is
+ * needed, `null` will be returned, and the caller should construct the `WHERE`
+ * clause component using the normal operator map(s) and parameterization.
+ *
+ * @param operator "beginsWith" | "contains" | "notContains" | "between"
+ * | "eq" | "ne" | "le" | "lt" | "ge" | "gt"
+ * @param operand any
+ * @returns (string | null) The `WHERE` clause component or `null` if N/A.
+ */
+function buildSpecialNullComparison(field, operator, operand) {
+	if (operand === null || operand === undefined) {
+		if (operator === 'eq') {
+			return `"${field}" IS NULL`;
+		} else if (operator === 'ne') {
+			return `"${field}" IS NOT NULL`;
+		}
+	}
+
+	// no special null handling required
+	return null;
+}
+
 const whereConditionFromPredicateObject = ({
 	field,
 	operator,
@@ -241,8 +300,16 @@ const whereConditionFromPredicateObject = ({
 		| keyof typeof comparisonOperatorMap;
 	operand: any;
 }): ParameterizedStatement => {
-	const comparisonOperator = comparisonOperatorMap[operator];
+	const specialNullClause = buildSpecialNullComparison(
+		field,
+		operator,
+		operand
+	);
+	if (specialNullClause) {
+		return [specialNullClause, []];
+	}
 
+	const comparisonOperator = comparisonOperatorMap[operator];
 	if (comparisonOperator) {
 		return [`"${field}" ${comparisonOperator} ?`, [operand]];
 	}

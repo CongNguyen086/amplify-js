@@ -8,6 +8,9 @@ import {
 	PredicatesGroup,
 	GraphQLFilter,
 	AuthModeStrategy,
+	ErrorHandler,
+	ProcessName,
+	AmplifyContext,
 } from '../../types';
 import {
 	buildGraphQLOperation,
@@ -17,14 +20,16 @@ import {
 	predicateToGraphQLFilter,
 	getTokenForCustomAuth,
 } from '../utils';
+import { USER_AGENT_SUFFIX_DATASTORE } from '../../util';
 import {
 	jitteredExponentialRetry,
 	ConsoleLogger as Logger,
 	Hub,
 	NonRetryableError,
+	BackgroundProcessManager,
 } from '@aws-amplify/core';
 import { ModelPredicateCreator } from '../../predicates';
-
+import { getSyncErrorType } from './errorMaps';
 const opResultDefaults = {
 	items: [],
 	nextToken: null,
@@ -36,12 +41,17 @@ const logger = new Logger('DataStore');
 class SyncProcessor {
 	private readonly typeQuery = new WeakMap<SchemaModel, [string, string]>();
 
+	private runningProcesses: BackgroundProcessManager;
+
 	constructor(
 		private readonly schema: InternalSchema,
 		private readonly syncPredicates: WeakMap<SchemaModel, ModelPredicate<any>>,
 		private readonly amplifyConfig: Record<string, any> = {},
-		private readonly authModeStrategy: AuthModeStrategy
+		private readonly authModeStrategy: AuthModeStrategy,
+		private readonly errorHandler: ErrorHandler,
+		private readonly amplifyContext: AmplifyContext
 	) {
+		amplifyContext.API = amplifyContext.API || API;
 		this.generateQueries();
 	}
 
@@ -78,14 +88,13 @@ class SyncProcessor {
 		return predicateToGraphQLFilter(predicatesGroup);
 	}
 
-	private async retrievePage<
-		T extends ModelInstanceMetadata = ModelInstanceMetadata
-	>(
+	private async retrievePage<T extends ModelInstanceMetadata>(
 		modelDefinition: SchemaModel,
 		lastSync: number,
 		nextToken: string,
 		limit: number = null,
-		filter: GraphQLFilter
+		filter: GraphQLFilter,
+		onTerminate: Promise<void>
 	): Promise<{ nextToken: string; startedAt: number; items: T[] }> {
 		const [opName, query] = this.typeQuery.get(modelDefinition);
 
@@ -108,6 +117,12 @@ class SyncProcessor {
 
 		let authModeAttempts = 0;
 		const authModeRetry = async () => {
+			if (!this.runningProcesses.isOpen) {
+				throw new Error(
+					'sync.retreievePage termination was requested. Exiting.'
+				);
+			}
+
 			try {
 				logger.debug(
 					`Attempting sync with authMode: ${readAuthModes[authModeAttempts]}`
@@ -118,6 +133,7 @@ class SyncProcessor {
 					opName,
 					modelDefinition,
 					authMode: readAuthModes[authModeAttempts],
+					onTerminate,
 				});
 				logger.debug(
 					`Sync successful with authMode: ${readAuthModes[authModeAttempts]}`
@@ -180,12 +196,14 @@ class SyncProcessor {
 		opName,
 		modelDefinition,
 		authMode,
+		onTerminate,
 	}: {
 		query: string;
 		variables: { limit: number; lastSync: number; nextToken: string };
 		opName: string;
 		modelDefinition: SchemaModel;
 		authMode: GRAPHQL_AUTH_MODE;
+		onTerminate: Promise<void>;
 	}): Promise<
 		GraphQLResult<{
 			[opName: string]: {
@@ -203,12 +221,15 @@ class SyncProcessor {
 						this.amplifyConfig
 					);
 
-					return await API.graphql({
+					return await this.amplifyContext.API.graphql({
 						query,
 						variables,
 						authMode,
 						authToken,
+						userAgentSuffix: USER_AGENT_SUFFIX_DATASTORE,
 					});
+
+					// TODO: onTerminate.then(() => API.cancel(...))
 				} catch (error) {
 					// Catch client-side (GraphQLAuthError) & 401/403 errors here so that we don't continue to retry
 					const clientOrForbiddenErrorMessage =
@@ -223,15 +244,33 @@ class SyncProcessor {
 							error.data[opName] &&
 							error.data[opName].items
 					);
-
 					if (this.partialDataFeatureFlagEnabled()) {
 						if (hasItems) {
 							const result = error;
 							result.data[opName].items = result.data[opName].items.filter(
 								item => item !== null
 							);
-
 							if (error.errors) {
+								await Promise.all(
+									error.errors.map(async err => {
+										try {
+											await this.errorHandler({
+												recoverySuggestion:
+													'Ensure app code is up to date, auth directives exist and are correct on each model, and that server-side data has not been invalidated by a schema change. If the problem persists, search for or create an issue: https://github.com/aws-amplify/amplify-js/issues',
+												localModel: null,
+												message: err.message,
+												model: modelDefinition.name,
+												operation: opName,
+												errorType: getSyncErrorType(err),
+												process: ProcessName.sync,
+												remoteModel: null,
+												cause: err,
+											});
+										} catch (e) {
+											logger.error('Sync error handler failed with:', e);
+										}
+									})
+								);
 								Hub.dispatch('datastore', {
 									event: 'syncQueriesPartialSyncError',
 									data: {
@@ -277,14 +316,28 @@ class SyncProcessor {
 					}
 				}
 			},
-			[query, variables]
+			[query, variables],
+			undefined,
+			onTerminate
 		);
 	}
 
 	start(
 		typesLastSync: Map<SchemaModel, [string, number]>
 	): Observable<SyncModelPage> {
-		let processing = true;
+		if (this.runningProcesses) {
+			throw new Error(
+				[
+					'The sync processor is already started!',
+					'Wait until it completes or `await stop()` it first!',
+					'(This is an Amplify bug; please open a Github Issue:',
+					'https://github.com/aws-amplify/amplify-js/issues)',
+				].join('\n')
+			);
+		}
+
+		this.runningProcesses = new BackgroundProcessManager();
+
 		const { maxRecordsToSync, syncPageSize } = this.amplifyConfig;
 		const parentPromises = new Map<string, Promise<void>>();
 		const observable = new Observable<SyncModelPage>(observer => {
@@ -303,75 +356,85 @@ class SyncProcessor {
 
 			const allModelsReady = Array.from(sortedTypesLastSyncs.entries())
 				.filter(([{ syncable }]) => syncable)
-				.map(async ([modelDefinition, [namespace, lastSync]]) => {
-					let done = false;
-					let nextToken: string = null;
-					let startedAt: number = null;
-					let items: ModelInstanceMetadata[] = null;
+				.map(([modelDefinition, [namespace, lastSync]]) =>
+					this.runningProcesses.add(async onTerminate => {
+						let done = false;
+						let nextToken: string = null;
+						let startedAt: number = null;
+						let items: ModelInstanceMetadata[] = null;
 
-					let recordsReceived = 0;
-					const filter = this.graphqlFilterFromPredicate(modelDefinition);
+						let recordsReceived = 0;
+						const filter = this.graphqlFilterFromPredicate(modelDefinition);
 
-					const parents = this.schema.namespaces[
-						namespace
-					].modelTopologicalOrdering.get(modelDefinition.name);
-					const promises = parents.map(parent =>
-						parentPromises.get(`${namespace}_${parent}`)
-					);
+						const parents = this.schema.namespaces[
+							namespace
+						].modelTopologicalOrdering.get(modelDefinition.name);
+						const promises = parents.map(parent =>
+							parentPromises.get(`${namespace}_${parent}`)
+						);
 
-					const promise = new Promise<void>(async res => {
-						await Promise.all(promises);
+						const promise = new Promise<void>(async res => {
+							await Promise.all(promises);
 
-						do {
-							if (!processing) {
-								return;
-							}
+							do {
+								if (!this.runningProcesses) {
+									return;
+								}
 
-							const limit = Math.min(
-								maxRecordsToSync - recordsReceived,
-								syncPageSize
-							);
+								const limit = Math.min(
+									maxRecordsToSync - recordsReceived,
+									syncPageSize
+								);
 
-							({ items, nextToken, startedAt } = await this.retrievePage(
-								modelDefinition,
-								lastSync,
-								nextToken,
-								limit,
-								filter
-							));
+								({ items, nextToken, startedAt } = await this.retrievePage(
+									modelDefinition,
+									lastSync,
+									nextToken,
+									limit,
+									filter,
+									onTerminate
+								));
 
-							recordsReceived += items.length;
+								recordsReceived += items.length;
 
-							done = nextToken === null || recordsReceived >= maxRecordsToSync;
+								done =
+									nextToken === null || recordsReceived >= maxRecordsToSync;
 
-							observer.next({
-								namespace,
-								modelDefinition,
-								items,
-								done,
-								startedAt,
-								isFullSync: !lastSync,
-							});
-						} while (!done);
+								observer.next({
+									namespace,
+									modelDefinition,
+									items,
+									done,
+									startedAt,
+									isFullSync: !lastSync,
+								});
+							} while (!done);
 
-						res();
-					});
+							res();
+						});
 
-					parentPromises.set(`${namespace}_${modelDefinition.name}`, promise);
+						parentPromises.set(`${namespace}_${modelDefinition.name}`, promise);
 
-					await promise;
-				});
+						await promise;
+					})
+				);
 
 			Promise.all(allModelsReady).then(() => {
 				observer.complete();
 			});
 
-			return () => {
-				processing = false;
-			};
+			return this.runningProcesses.addCleaner(async () => {
+				this.runningProcesses = undefined;
+			});
 		});
 
 		return observable;
+	}
+
+	async stop() {
+		logger.debug('stopping sync processor');
+		this.runningProcesses && (await this.runningProcesses.close());
+		logger.debug('sync processor stopped');
 	}
 }
 
